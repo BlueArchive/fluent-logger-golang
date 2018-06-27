@@ -215,6 +215,10 @@ func (f *Fluent) Close() (err error) {
 	return
 }
 
+func (f *Fluent) IsClosed() bool {
+	return f.conn == nil
+}
+
 // close closes the connection.
 func (f *Fluent) close() (err error) {
 	if f.conn != nil {
