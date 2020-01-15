@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/tinylib/msgp/msgp"
 )
 
 const (
@@ -19,10 +21,15 @@ const (
 	defaultSocketPath             = ""
 	defaultPort                   = 24224
 	defaultTimeout                = 3 * time.Second
-	defaultBufferLimit            = 8 * 1024 * 1024
+	defaultWriteTimeout           = time.Duration(0) // Write() will not time out
+	defaultBufferLimit            = 8 * 1024
 	defaultRetryWait              = 500
+	defaultMaxRetryWait           = 60000
 	defaultMaxRetry               = 13
 	defaultReconnectWaitIncreRate = 1.5
+	// Default sub-second precision value to false since it is only compatible
+	// with fluentd versions v0.14 and above.
+	defaultSubSecondPrecision = false
 )
 
 type Config struct {
@@ -31,20 +38,30 @@ type Config struct {
 	FluentNetwork    string        `json:"fluent_network"`
 	FluentSocketPath string        `json:"fluent_socket_path"`
 	Timeout          time.Duration `json:"timeout"`
+	WriteTimeout     time.Duration `json:"write_timeout"`
 	BufferLimit      int           `json:"buffer_limit"`
 	RetryWait        int           `json:"retry_wait"`
 	MaxRetry         int           `json:"max_retry"`
+	MaxRetryWait     int           `json:"max_retry_wait"`
 	TagPrefix        string        `json:"tag_prefix"`
-	AsyncConnect     bool          `json:"async_connect"`
-	MarshalAsJSON    bool          `json:"marshal_as_json"`
+	Async            bool          `json:"async"`
+	// Deprecated: Use Async instead
+	AsyncConnect  bool `json:"async_connect"`
+	MarshalAsJSON bool `json:"marshal_as_json"`
+
+	// Sub-second precision timestamps are only possible for those using fluentd
+	// v0.14+ and serializing their messages with msgpack.
+	SubSecondPrecision bool `json:"sub_second_precision"`
 }
 
 type Fluent struct {
 	Config
-	conn         io.WriteCloser
-	pending      []byte
-	reconnecting bool
-	mu           sync.Mutex
+
+	pending chan []byte
+	wg      sync.WaitGroup
+
+	muconn sync.Mutex
+	conn   net.Conn
 }
 
 // New creates a new Logger.
@@ -64,6 +81,9 @@ func New(config Config) (f *Fluent, err error) {
 	if config.Timeout == 0 {
 		config.Timeout = defaultTimeout
 	}
+	if config.WriteTimeout == 0 {
+		config.WriteTimeout = defaultWriteTimeout
+	}
 	if config.BufferLimit == 0 {
 		config.BufferLimit = defaultBufferLimit
 	}
@@ -73,11 +93,22 @@ func New(config Config) (f *Fluent, err error) {
 	if config.MaxRetry == 0 {
 		config.MaxRetry = defaultMaxRetry
 	}
+	if config.MaxRetryWait == 0 {
+		config.MaxRetryWait = defaultMaxRetryWait
+	}
 	if config.AsyncConnect {
-		f = &Fluent{Config: config, reconnecting: true}
-		f.reconnect()
+		fmt.Fprintf(os.Stderr, "fluent#New: AsyncConnect is now deprecated, please use Async instead")
+		config.Async = config.Async || config.AsyncConnect
+	}
+	if config.Async {
+		f = &Fluent{
+			Config:  config,
+			pending: make(chan []byte, config.BufferLimit),
+		}
+		f.wg.Add(1)
+		go f.run()
 	} else {
-		f = &Fluent{Config: config, reconnecting: false}
+		f = &Fluent{Config: config}
 		err = f.connect()
 	}
 	return
@@ -86,9 +117,6 @@ func New(config Config) (f *Fluent, err error) {
 // Post writes the output for a logging event.
 //
 // Examples:
-//
-//  // send string
-//  f.Post("tag_name", "data")
 //
 //  // send map[string]
 //  mapStringData := map[string]string{
@@ -121,6 +149,10 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 		tag = f.TagPrefix + "." + tag
 	}
 
+	if m, ok := message.(msgp.Marshaler); ok {
+		return f.EncodeAndPostData(tag, tm, m)
+	}
+
 	msg := reflect.ValueOf(message)
 	msgtype := msg.Type()
 
@@ -142,9 +174,9 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 	}
 
 	if msgtype.Kind() != reflect.Map {
-		return errors.New("message must be a map")
+		return errors.New("fluent#PostWithTime: message must be a map")
 	} else if msgtype.Key().Kind() != reflect.String {
-		return errors.New("map keys must be strings")
+		return errors.New("fluent#PostWithTime: map keys must be strings")
 	}
 
 	kv := make(map[string]interface{})
@@ -156,27 +188,25 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 }
 
 func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}) error {
-	if data, dumperr := f.EncodeData(tag, tm, message); dumperr != nil {
-		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%s' to msgpack:%s", message, dumperr)
-		// fmt.Println("fluent#Post: can't convert to msgpack:", message, dumperr)
-	} else {
-		f.PostRawData(data)
-		return nil
+	var data []byte
+	var err error
+	if data, err = f.EncodeData(tag, tm, message); err != nil {
+		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%#v' to msgpack:%v", message, err)
 	}
+	return f.postRawData(data)
 }
 
+// Deprecated: Use EncodeAndPostData instead
 func (f *Fluent) PostRawData(data []byte) {
-	f.mu.Lock()
-	f.pending = append(f.pending, data...)
-	f.mu.Unlock()
-	if err := f.send(); err != nil {
-		f.close()
-		if len(f.pending) > f.Config.BufferLimit {
-			f.flushBuffer()
-		}
-	} else {
-		f.flushBuffer()
+	f.postRawData(data)
+}
+
+func (f *Fluent) postRawData(data []byte) error {
+	if f.Config.Async {
+		return f.appendBuffer(data)
 	}
+	// Synchronous write
+	return f.write(data)
 }
 
 // For sending forward protocol adopted JSON
@@ -199,6 +229,9 @@ func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data
 		msg := Message{Tag: tag, Time: timeUnix, Record: message}
 		chunk := &MessageChunk{message: msg}
 		data, err = json.Marshal(chunk)
+	} else if f.Config.SubSecondPrecision {
+		msg := &MessageExt{Tag: tag, Time: EventTime(tm), Record: message}
+		data, err = msg.MarshalMsg(nil)
 	} else {
 		msg := &Message{Tag: tag, Time: timeUnix, Record: message}
 		data, err = msg.MarshalMsg(nil)
@@ -206,10 +239,11 @@ func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data
 	return
 }
 
-// Close closes the connection.
+// Close closes the connection, waiting for pending logs to be sent
 func (f *Fluent) Close() (err error) {
-	if len(f.pending) > 0 {
-		err = f.send()
+	if f.Config.Async {
+		close(f.pending)
+		f.wg.Wait()
 	}
 	f.close()
 	return
@@ -219,23 +253,29 @@ func (f *Fluent) IsClosed() bool {
 	return f.conn == nil
 }
 
-// close closes the connection.
-func (f *Fluent) close() (err error) {
-	if f.conn != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-	} else {
-		return
+// appendBuffer appends data to buffer with lock.
+func (f *Fluent) appendBuffer(data []byte) error {
+	select {
+	case f.pending <- data:
+	default:
+		return fmt.Errorf("fluent#appendBuffer: Buffer full, limit %v", f.Config.BufferLimit)
 	}
+	return nil
+}
+
+// close closes the connection.
+func (f *Fluent) close() {
+	f.muconn.Lock()
 	if f.conn != nil {
 		f.conn.Close()
 		f.conn = nil
 	}
-	return
+	f.muconn.Unlock()
 }
 
 // connect establishes a new connection using the specified transport.
 func (f *Fluent) connect() (err error) {
+
 	switch f.Config.FluentNetwork {
 	case "tcp":
 		f.conn, err = net.DialTimeout(f.Config.FluentNetwork, f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort), f.Config.Timeout)
@@ -244,52 +284,63 @@ func (f *Fluent) connect() (err error) {
 	default:
 		err = net.UnknownNetworkError(f.Config.FluentNetwork)
 	}
-	return
+	return err
+}
+
+func (f *Fluent) run() {
+	for {
+		select {
+		case entry, ok := <-f.pending:
+			if !ok {
+				f.wg.Done()
+				return
+			}
+			err := f.write(entry)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] Unable to send logs to fluentd, reconnecting...\n", time.Now().Format(time.RFC3339))
+			}
+		}
+	}
 }
 
 func e(x, y float64) int {
 	return int(math.Pow(x, y))
 }
 
-func (f *Fluent) reconnect() {
-	go func() {
-		for i := 0; ; i++ {
+func (f *Fluent) write(data []byte) error {
+
+	for i := 0; i < f.Config.MaxRetry; i++ {
+
+		// Connect if needed
+		f.muconn.Lock()
+		if f.conn == nil {
 			err := f.connect()
-			if err == nil {
-				f.mu.Lock()
-				f.reconnecting = false
-				f.mu.Unlock()
-				break
-			} else {
-				if i == f.Config.MaxRetry {
-					panic("fluent#reconnect: failed to reconnect!")
-				}
+			if err != nil {
+				f.muconn.Unlock()
 				waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
+				if waitTime > f.Config.MaxRetryWait {
+					waitTime = f.Config.MaxRetryWait
+				}
 				time.Sleep(time.Duration(waitTime) * time.Millisecond)
+				continue
 			}
 		}
-	}()
-}
+		f.muconn.Unlock()
 
-func (f *Fluent) flushBuffer() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pending = f.pending[0:0]
-}
-
-func (f *Fluent) send() (err error) {
-	if f.conn == nil {
-		if f.reconnecting == false {
-			f.mu.Lock()
-			f.reconnecting = true
-			f.mu.Unlock()
-			f.reconnect()
+		// We're connected, write data
+		t := f.Config.WriteTimeout
+		if time.Duration(0) < t {
+			f.conn.SetWriteDeadline(time.Now().Add(t))
+		} else {
+			f.conn.SetWriteDeadline(time.Time{})
 		}
-		err = errors.New("fluent#send: can't send logs, client is reconnecting")
-	} else {
-		f.mu.Lock()
-		_, err = f.conn.Write(f.pending)
-		f.mu.Unlock()
+		_, err := f.conn.Write(data)
+		if err != nil {
+			f.close()
+		} else {
+			return err
+		}
 	}
-	return
+
+	return fmt.Errorf("fluent#write: failed to reconnect, max retry: %v", f.Config.MaxRetry)
 }
