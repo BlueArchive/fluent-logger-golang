@@ -250,6 +250,8 @@ func (f *Fluent) Close() (err error) {
 }
 
 func (f *Fluent) IsClosed() bool {
+	f.muconn.Lock()
+	defer f.muconn.Unlock()
 	return f.conn == nil
 }
 
@@ -265,16 +267,21 @@ func (f *Fluent) appendBuffer(data []byte) error {
 
 // close closes the connection.
 func (f *Fluent) close() {
+
 	f.muconn.Lock()
+	defer f.muconn.Unlock()
+
 	if f.conn != nil {
 		f.conn.Close()
 		f.conn = nil
 	}
-	f.muconn.Unlock()
 }
 
 // connect establishes a new connection using the specified transport.
 func (f *Fluent) connect() (err error) {
+
+	f.muconn.Lock()
+	defer f.muconn.Unlock()
 
 	switch f.Config.FluentNetwork {
 	case "tcp":
@@ -312,11 +319,9 @@ func (f *Fluent) write(data []byte) error {
 	for i := 0; i < f.Config.MaxRetry; i++ {
 
 		// Connect if needed
-		f.muconn.Lock()
-		if f.conn == nil {
+		if f.IsClosed() {
 			err := f.connect()
 			if err != nil {
-				f.muconn.Unlock()
 				waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
 				if waitTime > f.Config.MaxRetryWait {
 					waitTime = f.Config.MaxRetryWait
@@ -325,7 +330,6 @@ func (f *Fluent) write(data []byte) error {
 				continue
 			}
 		}
-		f.muconn.Unlock()
 
 		// We're connected, write data
 		t := f.Config.WriteTimeout
