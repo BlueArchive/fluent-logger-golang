@@ -1,6 +1,7 @@
 package fluent
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +31,8 @@ const (
 	// Default sub-second precision value to false since it is only compatible
 	// with fluentd versions v0.14 and above.
 	defaultSubSecondPrecision = false
+	// Default value whether to skip checking insecure certs on TLS connections.
+	defaultTlsInsecureSkipVerify = false
 )
 
 type Config struct {
@@ -52,6 +55,9 @@ type Config struct {
 	// Sub-second precision timestamps are only possible for those using fluentd
 	// v0.14+ and serializing their messages with msgpack.
 	SubSecondPrecision bool `json:"sub_second_precision"`
+
+	// Flag to skip verifying insecure certs on TLS connections
+	TlsInsecureSkipVerify bool `json: "tls_insecure_skip_verify"`
 }
 
 type Fluent struct {
@@ -100,6 +106,9 @@ func New(config Config) (f *Fluent, err error) {
 		fmt.Fprintf(os.Stderr, "fluent#New: AsyncConnect is now deprecated, please use Async instead")
 		config.Async = config.Async || config.AsyncConnect
 	}
+	if !config.TlsInsecureSkipVerify {
+		config.TlsInsecureSkipVerify = defaultTlsInsecureSkipVerify
+	}
 	if config.Async {
 		f = &Fluent{
 			Config:  config,
@@ -118,27 +127,26 @@ func New(config Config) (f *Fluent, err error) {
 //
 // Examples:
 //
-//  // send map[string]
-//  mapStringData := map[string]string{
-//  	"foo":  "bar",
-//  }
-//  f.Post("tag_name", mapStringData)
+//	// send map[string]
+//	mapStringData := map[string]string{
+//		"foo":  "bar",
+//	}
+//	f.Post("tag_name", mapStringData)
 //
-//  // send message with specified time
-//  mapStringData := map[string]string{
-//  	"foo":  "bar",
-//  }
-//  tm := time.Now()
-//  f.PostWithTime("tag_name", tm, mapStringData)
+//	// send message with specified time
+//	mapStringData := map[string]string{
+//		"foo":  "bar",
+//	}
+//	tm := time.Now()
+//	f.PostWithTime("tag_name", tm, mapStringData)
 //
-//  // send struct
-//  structData := struct {
-//  		Name string `msg:"name"`
-//  } {
-//  		"john smith",
-//  }
-//  f.Post("tag_name", structData)
-//
+//	// send struct
+//	structData := struct {
+//			Name string `msg:"name"`
+//	} {
+//			"john smith",
+//	}
+//	f.Post("tag_name", structData)
 func (f *Fluent) Post(tag string, message interface{}) error {
 	timeNow := time.Now()
 	return f.PostWithTime(tag, timeNow, message)
@@ -279,6 +287,19 @@ func (f *Fluent) connect() (err error) {
 	switch f.Config.FluentNetwork {
 	case "tcp":
 		f.conn, err = net.DialTimeout(f.Config.FluentNetwork, f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort), f.Config.Timeout)
+	case "tls":
+		tlsConfig := &tls.Config{InsecureSkipVerify: f.Config.TlsInsecureSkipVerify,
+			MinVersion: tls.VersionTLS10,
+			MaxVersion: tls.VersionTLS13,
+		}
+		f.conn, err = tls.DialWithDialer(
+			&net.Dialer{Timeout: f.Config.Timeout},
+			"tcp",
+			f.Config.FluentHost+":"+strconv.Itoa(f.Config.FluentPort), tlsConfig,
+		)
+		if err != nil {
+			f.conn = nil
+		}
 	case "unix":
 		f.conn, err = net.DialTimeout(f.Config.FluentNetwork, f.Config.FluentSocketPath, f.Config.Timeout)
 	default:
